@@ -1,0 +1,30 @@
+dataset: unsw_nb15
+model_type: dual_memory_hdc
+experiment_name: unsw_dual_memory
+data_dir: /Users/jasonwvh/Documents/projects/hdc/data
+output_dir: /Users/jasonwvh/Documents/projects/hdc/outputs
+stream_mode: staged
+window_size: 2048
+warmup_size: 12000
+hd_dim: 4096
+bins: 64
+base_lr: 5.5
+rare_class_boost: 2.75
+regen_rate: 0.05
+seed: 7
+prototype_clip: 4096
+memory_mix:
+  benign_plastic_weight: 0.7
+  attack_plastic_weight: 0.2
+  stable_margin_threshold: 0.1
+  benign_decay: 0.993
+drift:
+  history: 3
+  f1_drop_threshold: 0.07
+  fp_rate_rise_threshold: 0.03
+  margin_drop_threshold: 0.04
+  benign_lr_boost: 1.5
+  cooloff_windows: 2
+stagnation:
+  patience: 2
+  min_improvement: 0.003

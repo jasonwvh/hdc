@@ -1,0 +1,33 @@
+dataset: unsw_nb15
+model_type: offline_hdc_tuned
+benchmark_mode: offline
+task_mode: both
+experiment_name: unsw_offline_hdc_tuned
+data_dir: /Users/jasonwvh/Documents/projects/hdc/data
+output_dir: /Users/jasonwvh/Documents/projects/hdc/outputs/offline
+split_strategy: dataset_default
+validation_fraction: 0.15
+latency_mode: inference_only
+hd_dim: 512
+bins: 64
+base_lr: 0.035
+rare_class_boost: 2.75
+regen_rate: 0.05
+seed: 7
+prototype_clip: 4096
+row_limits:
+  train: 10000
+  val: 3000
+  test: 4000
+feature_selection:
+  mode: variance_mi
+  variance_threshold: 1.0e-6
+  top_k: 96
+hdc:
+  learning_rate: 0.035
+  bootstrap_fraction: 0.01
+  batch_size: 1024
+  iterative_epoch_candidates: [5, 15, 30]
+  regeneration_rounds: 4
+  scale_by_sqrt_features: true
+  row_normalize: false

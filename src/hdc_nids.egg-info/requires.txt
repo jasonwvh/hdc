@@ -1,0 +1,4 @@
+matplotlib>=3.10
+numpy>=2.4
+PyYAML>=6.0
+scikit-learn>=1.8

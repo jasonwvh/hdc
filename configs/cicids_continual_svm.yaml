@@ -1,0 +1,16 @@
+dataset: cicids2017
+model_type: continual_svm
+benchmark_mode: continual
+task_mode: both
+experiment_name: cicids_continual_svm
+data_dir: /Users/jasonwvh/Documents/projects/hdc/data
+output_dir: /Users/jasonwvh/Documents/projects/hdc/outputs/continual
+stream_mode: prequential
+window_size: 4096
+warmup_size: 16384
+seed: 7
+svm:
+  alpha: 0.00001
+  max_iter: 20
+  partial_fit_epochs: 3
+

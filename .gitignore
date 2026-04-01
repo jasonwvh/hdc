@@ -1,0 +1,11 @@
+/data
+/outputs
+/.venv
+/.mplconfig
+/.torch_extensions
+/.ipynb_checkpoints
+/.vscode
+/.idea
+/.pytest_cache
+/.mypy_cache
+*.pyc

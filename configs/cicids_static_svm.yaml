@@ -1,0 +1,17 @@
+dataset: cicids2017
+model_type: static_svm
+experiment_name: cicids_static_svm
+data_dir: /Users/jasonwvh/Documents/projects/hdc/data
+output_dir: /Users/jasonwvh/Documents/projects/hdc/outputs
+window_size: 4096
+warmup_size: 16384
+hd_dim: 4096
+bins: 64
+base_lr: 6.0
+rare_class_boost: 2.5
+regen_rate: 0.05
+seed: 7
+prototype_clip: 4096
+svm:
+  alpha: 0.0001
+  max_iter: 20

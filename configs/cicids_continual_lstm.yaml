@@ -1,0 +1,20 @@
+dataset: cicids2017
+model_type: continual_lstm
+benchmark_mode: continual
+task_mode: both
+experiment_name: cicids_continual_lstm
+data_dir: /Users/jasonwvh/Documents/projects/hdc/data
+output_dir: /Users/jasonwvh/Documents/projects/hdc/outputs/continual
+stream_mode: prequential
+window_size: 4096
+warmup_size: 16384
+seed: 7
+lstm:
+  hidden_dim: 16
+  sequence_length: 4
+  learning_rate: 0.01
+  epochs: 1
+  batch_size: 128
+  gradient_clip: 1.0
+  update_sample_limit: 1024
+

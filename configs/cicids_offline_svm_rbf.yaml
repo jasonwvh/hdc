@@ -1,0 +1,22 @@
+dataset: cicids2017
+model_type: offline_svm_rbf
+benchmark_mode: offline
+task_mode: both
+experiment_name: cicids_offline_svm_rbf
+data_dir: /Users/jasonwvh/Documents/projects/hdc/data
+output_dir: /Users/jasonwvh/Documents/projects/hdc/outputs/offline
+split_strategy: dataset_default
+validation_fraction: 0.15
+latency_mode: inference_only
+seed: 7
+row_limits:
+  train: 12000
+  val: 4000
+  test: 4000
+feature_selection:
+  mode: variance_mi
+  variance_threshold: 1.0e-6
+  top_k: 96
+svm:
+  c_values: [1.0, 10.0]
+  gamma_values: ["scale", 0.1]

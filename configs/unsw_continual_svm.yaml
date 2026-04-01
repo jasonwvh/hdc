@@ -1,0 +1,16 @@
+dataset: unsw_nb15
+model_type: continual_svm
+benchmark_mode: continual
+task_mode: both
+experiment_name: unsw_continual_svm
+data_dir: /Users/jasonwvh/Documents/projects/hdc/data
+output_dir: /Users/jasonwvh/Documents/projects/hdc/outputs/continual
+stream_mode: staged
+window_size: 2048
+warmup_size: 12000
+seed: 7
+svm:
+  alpha: 0.0001
+  max_iter: 20
+  partial_fit_epochs: 1
+
