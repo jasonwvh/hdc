@@ -402,7 +402,7 @@ class OnlineSVMModel(StaticSVMModel):
 
 
 class OnlineLSTMModel(BaseModel):
-    """Lightweight online LSTM baseline implemented in NumPy."""
+    """PyTorch streaming LSTM baseline over time-ordered continual windows."""
 
     def __init__(
         self,
@@ -415,8 +415,11 @@ class OnlineLSTMModel(BaseModel):
         batch_size: int,
         gradient_clip: float,
         update_sample_limit: int,
+        dropout: float,
         seed: int,
     ) -> None:
+        if torch is None or nn is None:
+            raise RuntimeError("PyTorch is required for OnlineLSTMModel.")
         self.preprocessor = preprocessor
         self.class_labels = preprocessor.class_labels
         self.class_count = len(self.class_labels)
@@ -424,28 +427,24 @@ class OnlineLSTMModel(BaseModel):
         self.attack_indices = [idx for idx in range(self.class_count) if idx != self.benign_index]
         self.input_dim = preprocessor.dense_dim
         self.hidden_dim = hidden_dim
-        self.sequence_length = sequence_length
+        self.sequence_length = max(1, sequence_length)
         self.learning_rate = learning_rate
-        self.epochs = epochs
-        self.batch_size = batch_size
+        self.epochs = max(1, epochs)
+        self.batch_size = max(1, batch_size)
         self.gradient_clip = gradient_clip
         self.update_sample_limit = update_sample_limit
+        self.dropout = dropout
         self.rng = np.random.default_rng(seed)
-        scale = 1.0 / np.sqrt(max(self.input_dim, 1))
-        recurrent_scale = 1.0 / np.sqrt(max(self.hidden_dim, 1))
-
-        self.W_x = self.rng.normal(0.0, scale, size=(self.input_dim, 4 * self.hidden_dim)).astype(np.float32)
-        self.W_h = self.rng.normal(0.0, recurrent_scale, size=(self.hidden_dim, 4 * self.hidden_dim)).astype(np.float32)
-        self.b = np.zeros((4 * self.hidden_dim,), dtype=np.float32)
-        self.W_y = self.rng.normal(0.0, recurrent_scale, size=(self.hidden_dim, self.class_count)).astype(np.float32)
-        self.b_y = np.zeros((self.class_count,), dtype=np.float32)
-
+        self.device = torch.device("cpu")
+        torch.manual_seed(seed)
+        self.model = _OfflineTorchLSTM(
+            input_size=self.input_dim,
+            hidden_dim=self.hidden_dim,
+            class_count=self.class_count,
+            dropout=self.dropout,
+        ).to(self.device)
+        self.optimizer = torch.optim.Adam(self.model.parameters(), lr=self.learning_rate)
         self.context_tail = np.zeros((self.sequence_length - 1, self.input_dim), dtype=np.float32)
-
-    @staticmethod
-    def _sigmoid(values: np.ndarray) -> np.ndarray:
-        clipped = np.clip(values, -30.0, 30.0)
-        return (1.0 / (1.0 + np.exp(-clipped))).astype(np.float32)
 
     def _make_sequences(self, dense: np.ndarray) -> np.ndarray:
         if dense.shape[0] == 0:
@@ -468,69 +467,6 @@ class OnlineLSTMModel(BaseModel):
         combined = np.vstack([self.context_tail, dense]).astype(np.float32)
         self.context_tail = combined[-(self.sequence_length - 1) :]
 
-    def _forward(self, sequences: np.ndarray) -> tuple[np.ndarray, dict[str, np.ndarray]]:
-        batch_size = sequences.shape[0]
-        if batch_size == 0:
-            empty = np.zeros((0, self.class_count), dtype=np.float32)
-            cache = {
-                "x": sequences,
-                "h": np.zeros((0, self.sequence_length, self.hidden_dim), dtype=np.float32),
-                "c": np.zeros((0, self.sequence_length, self.hidden_dim), dtype=np.float32),
-                "i": np.zeros((0, self.sequence_length, self.hidden_dim), dtype=np.float32),
-                "f": np.zeros((0, self.sequence_length, self.hidden_dim), dtype=np.float32),
-                "o": np.zeros((0, self.sequence_length, self.hidden_dim), dtype=np.float32),
-                "g": np.zeros((0, self.sequence_length, self.hidden_dim), dtype=np.float32),
-                "h_last": np.zeros((0, self.hidden_dim), dtype=np.float32),
-            }
-            return empty, cache
-
-        h = np.zeros((batch_size, self.sequence_length, self.hidden_dim), dtype=np.float32)
-        c = np.zeros((batch_size, self.sequence_length, self.hidden_dim), dtype=np.float32)
-        i_gate = np.zeros_like(h)
-        f_gate = np.zeros_like(h)
-        o_gate = np.zeros_like(h)
-        g_gate = np.zeros_like(h)
-        h_prev = np.zeros((batch_size, self.hidden_dim), dtype=np.float32)
-        c_prev = np.zeros((batch_size, self.hidden_dim), dtype=np.float32)
-
-        for step in range(self.sequence_length):
-            x_t = sequences[:, step, :]
-            gates = x_t @ self.W_x + h_prev @ self.W_h + self.b
-            i_t = self._sigmoid(gates[:, : self.hidden_dim])
-            f_t = self._sigmoid(gates[:, self.hidden_dim : 2 * self.hidden_dim])
-            o_t = self._sigmoid(gates[:, 2 * self.hidden_dim : 3 * self.hidden_dim])
-            g_t = np.tanh(gates[:, 3 * self.hidden_dim :]).astype(np.float32)
-            c_t = f_t * c_prev + i_t * g_t
-            h_t = o_t * np.tanh(c_t).astype(np.float32)
-
-            i_gate[:, step, :] = i_t
-            f_gate[:, step, :] = f_t
-            o_gate[:, step, :] = o_t
-            g_gate[:, step, :] = g_t
-            c[:, step, :] = c_t
-            h[:, step, :] = h_t
-            h_prev = h_t
-            c_prev = c_t
-
-        h_last = h[:, -1, :]
-        logits = h_last @ self.W_y + self.b_y
-        cache = {
-            "x": sequences,
-            "h": h,
-            "c": c,
-            "i": i_gate,
-            "f": f_gate,
-            "o": o_gate,
-            "g": g_gate,
-            "h_last": h_last,
-        }
-        return logits.astype(np.float32), cache
-
-    def _softmax(self, logits: np.ndarray) -> np.ndarray:
-        shifted = logits - logits.max(axis=1, keepdims=True)
-        exp_logits = np.exp(shifted).astype(np.float32)
-        return exp_logits / np.clip(exp_logits.sum(axis=1, keepdims=True), 1e-6, None)
-
     def _class_weights(self, labels: np.ndarray) -> np.ndarray:
         counts = np.bincount(labels, minlength=self.class_count).astype(np.float32)
         weights = np.ones((self.class_count,), dtype=np.float32)
@@ -540,103 +476,50 @@ class OnlineLSTMModel(BaseModel):
             weights[nonzero] /= float(np.mean(weights[nonzero]))
         return weights
 
-    def _backward(
-        self,
-        cache: dict[str, np.ndarray],
-        probabilities: np.ndarray,
-        labels: np.ndarray,
-        sample_weights: np.ndarray,
-    ) -> dict[str, np.ndarray]:
-        batch_size = max(labels.shape[0], 1)
-        grad_logits = probabilities.copy()
-        grad_logits[np.arange(labels.shape[0]), labels] -= 1.0
-        grad_logits *= sample_weights[:, None] / float(batch_size)
-
-        grad_W_y = cache["h_last"].T @ grad_logits
-        grad_b_y = grad_logits.sum(axis=0)
-        grad_h = grad_logits @ self.W_y.T
-
-        grad_W_x = np.zeros_like(self.W_x)
-        grad_W_h = np.zeros_like(self.W_h)
-        grad_b = np.zeros_like(self.b)
-        grad_h_next = np.zeros((labels.shape[0], self.hidden_dim), dtype=np.float32)
-        grad_c_next = np.zeros((labels.shape[0], self.hidden_dim), dtype=np.float32)
-
-        for step in range(self.sequence_length - 1, -1, -1):
-            h_t = cache["h"][:, step, :]
-            c_t = cache["c"][:, step, :]
-            c_prev = cache["c"][:, step - 1, :] if step > 0 else np.zeros_like(c_t)
-            h_prev = cache["h"][:, step - 1, :] if step > 0 else np.zeros_like(h_t)
-            x_t = cache["x"][:, step, :]
-            i_t = cache["i"][:, step, :]
-            f_t = cache["f"][:, step, :]
-            o_t = cache["o"][:, step, :]
-            g_t = cache["g"][:, step, :]
-            tanh_c = np.tanh(c_t).astype(np.float32)
-
-            grad_h_total = grad_h + grad_h_next if step == self.sequence_length - 1 else grad_h_next
-            grad_o = grad_h_total * tanh_c
-            grad_c = grad_h_total * o_t * (1.0 - tanh_c * tanh_c) + grad_c_next
-            grad_f = grad_c * c_prev
-            grad_i = grad_c * g_t
-            grad_g = grad_c * i_t
-            grad_c_next = grad_c * f_t
-
-            grad_i_input = grad_i * i_t * (1.0 - i_t)
-            grad_f_input = grad_f * f_t * (1.0 - f_t)
-            grad_o_input = grad_o * o_t * (1.0 - o_t)
-            grad_g_input = grad_g * (1.0 - g_t * g_t)
-            grad_gates = np.concatenate(
-                [grad_i_input, grad_f_input, grad_o_input, grad_g_input],
-                axis=1,
-            ).astype(np.float32)
-
-            grad_W_x += x_t.T @ grad_gates
-            grad_W_h += h_prev.T @ grad_gates
-            grad_b += grad_gates.sum(axis=0)
-            grad_h_next = grad_gates @ self.W_h.T
-
-        return {
-            "W_x": grad_W_x,
-            "W_h": grad_W_h,
-            "b": grad_b,
-            "W_y": grad_W_y,
-            "b_y": grad_b_y,
-        }
-
-    def _apply_gradients(self, gradients: dict[str, np.ndarray]) -> None:
-        for gradient in gradients.values():
-            np.clip(gradient, -self.gradient_clip, self.gradient_clip, out=gradient)
-        self.W_x -= self.learning_rate * gradients["W_x"]
-        self.W_h -= self.learning_rate * gradients["W_h"]
-        self.b -= self.learning_rate * gradients["b"]
-        self.W_y -= self.learning_rate * gradients["W_y"]
-        self.b_y -= self.learning_rate * gradients["b_y"]
-
     def _train_batch(self, dense: np.ndarray, labels: np.ndarray) -> None:
+        if dense.shape[0] == 0:
+            return
         sequences = self._make_sequences(dense)
-        sample_weights = self._class_weights(labels)[labels]
+        class_weights = torch.tensor(
+            self._class_weights(labels),
+            dtype=torch.float32,
+            device=self.device,
+        )
+        criterion = nn.CrossEntropyLoss(weight=class_weights)
         indices = np.arange(labels.shape[0])
         for _ in range(self.epochs):
+            self.model.train()
             self.rng.shuffle(indices)
             for chunk in chunked(indices.tolist(), self.batch_size):
                 batch_idx = np.asarray(chunk, dtype=np.int32)
-                logits, cache = self._forward(sequences[batch_idx])
-                probabilities = self._softmax(logits)
-                gradients = self._backward(cache, probabilities, labels[batch_idx], sample_weights[batch_idx])
-                self._apply_gradients(gradients)
-        self._advance_context(dense)
+                x_batch = torch.from_numpy(sequences[batch_idx]).to(self.device)
+                y_batch = torch.from_numpy(labels[batch_idx].astype(np.int64, copy=False)).to(self.device)
+                self.optimizer.zero_grad()
+                logits = self.model(x_batch)
+                loss = criterion(logits, y_batch)
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=self.gradient_clip)
+                self.optimizer.step()
 
     def fit_initial(self, batch: PreparedBatch) -> None:
+        dense = batch.dense.astype(np.float32, copy=False)
         self.context_tail = np.zeros((self.sequence_length - 1, self.input_dim), dtype=np.float32)
-        self._train_batch(batch.dense.astype(np.float32), batch.class_indices.astype(np.int32))
+        self._train_batch(dense, batch.class_indices.astype(np.int32, copy=False))
+        self._advance_context(dense)
+
+    def _predict_probabilities(self, dense: np.ndarray) -> np.ndarray:
+        sequences = self._make_sequences(dense.astype(np.float32, copy=False))
+        tensor = torch.from_numpy(sequences).to(self.device)
+        self.model.eval()
+        with torch.no_grad():
+            logits = self.model(tensor)
+            probabilities = torch.softmax(logits, dim=1)
+        return probabilities.cpu().numpy().astype(np.float32, copy=False)
 
     def predict(self, batch: PreparedBatch) -> PredictionOutput:
-        sequences = self._make_sequences(batch.dense.astype(np.float32))
         score_start = monotonic_ms()
-        logits, _ = self._forward(sequences)
+        probabilities = self._predict_probabilities(batch.dense)
         score_ms = monotonic_ms() - score_start
-        probabilities = self._softmax(logits)
         predicted_class_indices = probabilities.argmax(axis=1)
         predicted_labels = np.asarray(
             [self.class_labels[index] for index in predicted_class_indices],
@@ -668,47 +551,25 @@ class OnlineLSTMModel(BaseModel):
     ) -> list[dict[str, Any]]:
         _ = prediction
         _ = drift_active
-        dense = batch.dense.astype(np.float32)
-        labels = batch.class_indices.astype(np.int32)
-        if self.update_sample_limit > 0 and dense.shape[0] > self.update_sample_limit:
-            label_buckets = {label: np.where(labels == label)[0] for label in np.unique(labels)}
-            selected: list[int] = []
-            per_label = max(1, self.update_sample_limit // max(len(label_buckets), 1))
-            for bucket in label_buckets.values():
-                take = min(per_label, bucket.shape[0])
-                chosen = self.rng.choice(bucket, size=take, replace=False)
-                selected.extend(chosen.tolist())
-            if len(selected) < self.update_sample_limit:
-                remaining = np.setdiff1d(np.arange(labels.shape[0]), np.asarray(selected, dtype=np.int32), assume_unique=False)
-                if remaining.size:
-                    extra_take = min(self.update_sample_limit - len(selected), remaining.size)
-                    selected.extend(self.rng.choice(remaining, size=extra_take, replace=False).tolist())
-            selected = sorted(set(selected))
-            dense = dense[selected]
-            labels = labels[selected]
-        self._train_batch(dense, labels)
+        full_dense = batch.dense.astype(np.float32, copy=False)
+        train_dense = full_dense
+        labels = batch.class_indices.astype(np.int32, copy=False)
+        train_labels = labels
+        if self.update_sample_limit > 0 and full_dense.shape[0] > self.update_sample_limit:
+            train_dense = full_dense[-self.update_sample_limit :]
+            train_labels = labels[-self.update_sample_limit :]
+        self._train_batch(train_dense, train_labels)
+        self._advance_context(full_dense)
         return []
 
     def checkpoint(self, path: str | Path) -> None:
-        np.savez_compressed(
-            path,
-            W_x=self.W_x,
-            W_h=self.W_h,
-            b=self.b,
-            W_y=self.W_y,
-            b_y=self.b_y,
-            context_tail=self.context_tail,
-        )
+        payload = {key: value.detach().cpu().numpy() for key, value in self.model.state_dict().items()}
+        payload["context_tail"] = self.context_tail
+        np.savez_compressed(path, **payload)
 
     def model_size_bytes(self) -> int:
-        return int(
-            self.W_x.nbytes
-            + self.W_h.nbytes
-            + self.b.nbytes
-            + self.W_y.nbytes
-            + self.b_y.nbytes
-            + self.context_tail.nbytes
-        )
+        parameter_bytes = sum(parameter.nelement() * parameter.element_size() for parameter in self.model.parameters())
+        return int(parameter_bytes + self.context_tail.nbytes)
 
 
 class OfflineSVMRBFModel(BaseModel):

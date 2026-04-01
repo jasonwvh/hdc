@@ -190,6 +190,7 @@ def _build_online_model(config: ExperimentConfig, preprocessor: TabularPreproces
             batch_size=config.lstm.batch_size,
             gradient_clip=config.lstm.gradient_clip,
             update_sample_limit=config.lstm.update_sample_limit,
+            dropout=config.lstm.dropout,
             seed=config.seed,
         )
     raise ValueError(f"Unsupported continual model type: {config.model_type}")

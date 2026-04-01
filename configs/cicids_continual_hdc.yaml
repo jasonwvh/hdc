@@ -8,7 +8,7 @@ output_dir: /Users/jasonwvh/Documents/projects/hdc/outputs/continual
 stream_mode: prequential
 window_size: 4096
 warmup_size: 16384
-hd_dim: 4096
+hd_dim: 512
 bins: 64
 base_lr: 0.035
 rare_class_boost: 2.5

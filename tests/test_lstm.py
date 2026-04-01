@@ -42,6 +42,7 @@ def test_online_lstm_predicts_and_updates() -> None:
         batch_size=2,
         gradient_clip=1.0,
         update_sample_limit=0,
+        dropout=0.1,
         seed=7,
     )
     model.fit_initial(warmup)

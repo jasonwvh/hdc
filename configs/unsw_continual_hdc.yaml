@@ -8,7 +8,7 @@ output_dir: /Users/jasonwvh/Documents/projects/hdc/outputs/continual
 stream_mode: staged
 window_size: 2048
 warmup_size: 12000
-hd_dim: 4096
+hd_dim: 512
 bins: 64
 base_lr: 0.035
 rare_class_boost: 2.75
