@@ -13,6 +13,9 @@ def _write_cicids_file(path: Path, rows: list[list[str]]) -> None:
         " Source IP",
         " Destination IP",
         " Timestamp",
+        " Source Port",
+        " Destination Port",
+        " Protocol",
         " Flow Duration",
         " Total Fwd Packets",
         " Label",
@@ -31,9 +34,9 @@ def test_canonicalize_cicids_web_attack_labels():
 def test_cicids_stream_drops_empty_labels_and_metadata(tmp_path: Path):
     data_dir = tmp_path / "data" / "CICIDS2017"
     data_dir.mkdir(parents=True)
-    benign_row = ["flow-1", "10.0.0.1", "10.0.0.2", "03/07/2017 08:55:58", "12.0", "3", "BENIGN"]
-    empty_row = ["flow-2", "10.0.0.1", "10.0.0.2", "", "4.0", "1", ""]
-    web_attack_row = ["flow-3", "10.0.0.1", "10.0.0.2", "6/7/2017 9:15", "7.0", "2", "Web Attack � Brute Force"]
+    benign_row = ["flow-1", "10.0.0.1", "10.0.0.2", "03/07/2017 08:55:58", "443", "51515", "6", "12.0", "3", "BENIGN"]
+    empty_row = ["flow-2", "10.0.0.1", "10.0.0.2", "", "80", "52000", "6", "4.0", "1", ""]
+    web_attack_row = ["flow-3", "10.0.0.1", "10.0.0.2", "6/7/2017 9:15", "12345", "80", "17", "7.0", "2", "Web Attack � Brute Force"]
     for filename in CICIDS_FILE_ORDER:
         rows = [benign_row]
         if filename == "Thursday-WorkingHours-Morning-WebAttacks.pcap_ISCX.csv":

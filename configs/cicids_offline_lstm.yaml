@@ -19,6 +19,7 @@ feature_selection:
   top_k: 96
 lstm:
   hidden_dim: 64
+  sequence_length: 8
   learning_rate: 0.001
   batch_size: 256
   dropout: 0.2

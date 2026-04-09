@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import csv
 import math
 import random
 from collections import defaultdict, deque
@@ -10,6 +9,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Iterable, Iterator
 
+import numpy as np
+import pandas as pd
 from sklearn.model_selection import train_test_split
 
 from .config import RowLimitConfig
@@ -94,81 +95,132 @@ def canonicalize_cicids_label(label: str) -> str:
     return cleaned
 
 
-def _cicids_protocol_token(value: str) -> str:
-    code = value.strip()
-    return {
-        "1": "icmp",
-        "6": "tcp",
-        "17": "udp",
-    }.get(code, code or "other")
+_PROTOCOL_MAP = {"1": "icmp", "6": "tcp", "17": "udp"}
+
+_WELL_KNOWN_PORTS = {
+    20: "ftp-data", 21: "ftp", 22: "ssh", 25: "smtp", 53: "dns",
+    80: "http", 110: "pop3", 143: "imap", 443: "https", 445: "smb",
+    3306: "mysql", 3389: "rdp", 8080: "http-alt",
+}
 
 
-def _cicids_port_bucket(value: str) -> str:
-    if value == "":
-        return "__UNK__"
-    try:
-        port = int(float(value))
-    except ValueError:
-        return "__UNK__"
-    well_known = {
-        20: "ftp-data",
-        21: "ftp",
-        22: "ssh",
-        25: "smtp",
-        53: "dns",
-        80: "http",
-        110: "pop3",
-        143: "imap",
-        443: "https",
-        445: "smb",
-        3306: "mysql",
-        3389: "rdp",
-        8080: "http-alt",
-    }
-    if port in well_known:
-        return well_known[port]
-    if port < 1024:
-        return "system"
-    if port < 49152:
-        return "registered"
-    return "ephemeral"
+def _port_bucket_vector(ports):
+    result = []
+    for p in ports:
+        try:
+            port = int(float(p))
+        except (ValueError, TypeError):
+            result.append("__UNK__")
+            continue
+        if port in _WELL_KNOWN_PORTS:
+            result.append(_WELL_KNOWN_PORTS[port])
+        elif port < 1024:
+            result.append("system")
+        elif port < 49152:
+            result.append("registered")
+        else:
+            result.append("ephemeral")
+    return result
 
 
-def _engineer_cicids_features(row: dict[str, str]) -> dict[str, str]:
-    features = {
-        key: _clean_numeric_string(value)
-        for key, value in row.items()
-        if key not in CICIDS_DROP_COLUMNS and key != "Label"
-    }
-    features.pop("Source Port", None)
-    features.pop("Destination Port", None)
-    features["Protocol"] = _cicids_protocol_token(row.get("Protocol", ""))
-    features["Src Port Bucket"] = _cicids_port_bucket(row.get("Source Port", ""))
-    features["Dst Port Bucket"] = _cicids_port_bucket(row.get("Destination Port", ""))
-    return features
+def _load_cicids_file_as_df(file_path: Path) -> pd.DataFrame:
+    df = pd.read_csv(file_path, low_memory=False, encoding="utf-8", encoding_errors="replace")
+    df.columns = df.columns.str.strip()
+
+    drop_cols = [c for c in CICIDS_DROP_COLUMNS if c in df.columns]
+    df = df.drop(columns=drop_cols)
+
+    if "Label" in df.columns:
+        df["Label"] = df["Label"].astype(str).str.strip()
+        df["Label"] = df["Label"].replace(CICIDS_CANONICAL_LABELS)
+        df = df[df["Label"].notna() & (df["Label"] != "") & (df["Label"] != "nan")]
+
+    if "Protocol" in df.columns:
+        df["Protocol"] = df["Protocol"].astype(str).str.strip().map(
+            lambda x: _PROTOCOL_MAP.get(x, x or "other")
+        )
+
+    for port_col, bucket_col in [("Source Port", "Src Port Bucket"), ("Destination Port", "Dst Port Bucket")]:
+        if port_col in df.columns:
+            df[bucket_col] = _port_bucket_vector(df[port_col])
+            df = df.drop(columns=[port_col])
+
+    df.replace([float("inf"), float("-inf")], np.nan, inplace=True)
+
+    return df
 
 
-def _iter_cicids_records(data_dir: Path) -> Iterator[RawRecord]:
+def _load_all_cicids_dfs(data_dir: Path, per_file_limit: int | None = None) -> list[tuple[str, pd.DataFrame]]:
     base_dir = data_dir / "CICIDS2017"
+    result = []
     for filename in CICIDS_FILE_ORDER:
         file_path = base_dir / filename
-        stage_name = Path(filename).stem
-        with file_path.open("r", encoding="utf-8", errors="replace", newline="") as handle:
-            reader = csv.DictReader(handle)
-            for row_index, raw_row in enumerate(reader):
-                row = _strip_keys(raw_row)
-                label = canonicalize_cicids_label(row.get("Label", ""))
-                if not label:
-                    continue
-                features = _engineer_cicids_features(row)
-                yield RawRecord(
-                    features=features,
-                    internal_label=label,
-                    binary_label=0 if label == CICIDS_BENIGN_LABEL else 1,
-                    source=filename,
-                    stage_name=stage_name,
-                    record_id=f"{filename}:{row_index}",
-                )
+        df = _load_cicids_file_as_df(file_path)
+        if per_file_limit is not None and len(df) > per_file_limit:
+            df = df.sample(n=per_file_limit, random_state=42)
+        df["_source"] = filename
+        df["_stage_name"] = Path(filename).stem
+        df["_row_index"] = range(len(df))
+        result.append((filename, df))
+    return result
+
+
+def _dataframe_to_records(df: pd.DataFrame) -> list[RawRecord]:
+    records = []
+    cols = df.columns.tolist()
+    feature_cols = [c for c in cols if not c.startswith("_")]
+    for row in df.itertuples(index=False):
+        row_dict = dict(zip(cols, row))
+        label = row_dict.get("Label", "")
+        if not label or label == "nan":
+            continue
+        features = {}
+        for k in feature_cols:
+            if k != "Label":
+                v = row_dict[k]
+                if isinstance(v, float) and np.isnan(v):
+                    features[k] = "nan"
+                else:
+                    features[k] = str(v).strip() if isinstance(v, str) else str(v)
+        records.append(RawRecord(
+            features=features,
+            internal_label=label,
+            binary_label=0 if label == CICIDS_BENIGN_LABEL else 1,
+            source=row_dict.get("_source", ""),
+            stage_name=row_dict.get("_stage_name", ""),
+            record_id=f"{row_dict.get('_source', '')}:{row_dict.get('_row_index', '')}",
+        ))
+    return records
+
+
+def _iter_cicids_records(data_dir: Path, max_records: int | None = None, per_file_limit: int | None = None) -> Iterator[RawRecord]:
+    base_dir = data_dir / "CICIDS2017"
+    count = 0
+    for filename in CICIDS_FILE_ORDER:
+        file_path = base_dir / filename
+        df = _load_cicids_file_as_df(file_path)
+        file_count = 0
+        cols = df.columns.tolist()
+        feature_cols = [c for c in cols if c != "Label"]
+        for idx, row in df.iterrows():
+            if max_records is not None and count >= max_records:
+                return
+            if per_file_limit is not None and file_count >= per_file_limit:
+                break
+            label = row.get("Label", "")
+            if not label or label == "nan":
+                continue
+            features = {k: str(row[k]) for k in feature_cols}
+            yield RawRecord(
+                features=features,
+                internal_label=label,
+                binary_label=0 if label == CICIDS_BENIGN_LABEL else 1,
+                source=filename,
+                stage_name=Path(filename).stem,
+                record_id=f"{filename}:{idx}",
+            )
+            count += 1
+            file_count += 1
 
 
 def _collect_warmup(
@@ -234,24 +286,22 @@ def _iter_unsw_records(data_dir: Path) -> Iterator[RawRecord]:
     file_order = ["UNSW_NB15_training-set.csv", "UNSW_NB15_testing-set.csv"]
     for filename in file_order:
         file_path = base_dir / filename
-        with file_path.open("r", encoding="utf-8", errors="replace", newline="") as handle:
-            reader = csv.DictReader(handle)
-            for row_index, raw_row in enumerate(reader):
-                row = _strip_keys(raw_row)
-                label = row["attack_cat"] if "attack_cat" in row else row["attack_cat"]
-                features = {
-                    key: value
-                    for key, value in row.items()
-                    if key not in UNSW_DROP_COLUMNS
-                }
-                yield RawRecord(
-                    features=features,
-                    internal_label=label,
-                    binary_label=0 if row["label"] == "0" else 1,
-                    source=filename,
-                    stage_name="raw_unsw",
-                    record_id=f"{filename}:{row_index}",
-                )
+        df = pd.read_csv(file_path, low_memory=False)
+        for row_index, row in df.iterrows():
+            label = str(row.get("attack_cat", "")).strip()
+            features = {
+                key: str(value).strip()
+                for key, value in row.items()
+                if key not in UNSW_DROP_COLUMNS
+            }
+            yield RawRecord(
+                features=features,
+                internal_label=label,
+                binary_label=0 if str(row.get("label", "0")) == "0" else 1,
+                source=filename,
+                stage_name="raw_unsw",
+                record_id=f"{filename}:{row_index}",
+            )
 
 
 def _dedupe_records(records: list[RawRecord]) -> list[RawRecord]:
@@ -259,7 +309,7 @@ def _dedupe_records(records: list[RawRecord]) -> list[RawRecord]:
     seen: set[tuple] = set()
     for record in records:
         fingerprint = (
-            tuple(sorted(record.features.items())),
+            tuple(record.features.values()),
             record.internal_label,
             record.binary_label,
         )
@@ -335,10 +385,35 @@ def build_offline_split(
 ) -> OfflineSplit:
     normalized = dataset.lower()
     if normalized == "cicids2017":
-        records = _dedupe_records(list(_iter_cicids_records(data_dir)))
+        all_dfs = _load_all_cicids_dfs(data_dir, per_file_limit=150000)
+        combined = pd.concat([df for _, df in all_dfs], ignore_index=True)
+
         if split_strategy in {"dataset_default", "stratified", "stratified_70_15_15"}:
-            train_records, temp_records = _split_records(records, train_size=0.70, seed=seed)
-            val_records, test_records = _split_records(list(temp_records), train_size=0.50, seed=seed + 1)
+            labels = combined["Label"].values
+            label_counts = pd.Series(labels).value_counts()
+            min_count = label_counts.min()
+            
+            if min_count < 2:
+                train_idx, temp_idx = train_test_split(
+                    np.arange(len(combined)), train_size=0.70, random_state=seed,
+                )
+                val_idx, test_idx = train_test_split(
+                    temp_idx, train_size=0.50, random_state=seed + 1,
+                )
+            else:
+                train_idx, temp_idx = train_test_split(
+                    np.arange(len(combined)), train_size=0.70, random_state=seed, stratify=labels,
+                )
+                temp_labels = labels[temp_idx]
+                temp_label_counts = pd.Series(temp_labels).value_counts()
+                if temp_label_counts.min() < 2:
+                    val_idx, test_idx = train_test_split(
+                        temp_idx, train_size=0.50, random_state=seed + 1,
+                    )
+                else:
+                    val_idx, test_idx = train_test_split(
+                        temp_idx, train_size=0.50, random_state=seed + 1, stratify=temp_labels,
+                    )
             resolved_strategy = "stratified_70_15_15"
         elif split_strategy in {"chronological_day_stress", "cicids_day_stress"}:
             train_sources = {
@@ -355,19 +430,35 @@ def build_offline_split(
                 "Friday-WorkingHours-Afternoon-PortScan.pcap_ISCX.csv",
                 "Friday-WorkingHours-Afternoon-DDos.pcap_ISCX.csv",
             }
-            train_records = [record for record in records if record.source in train_sources]
-            val_records = [record for record in records if record.source in val_sources]
-            test_records = [record for record in records if record.source in test_sources]
+            train_idx = combined.index[combined["_source"].isin(train_sources)].values
+            val_idx = combined.index[combined["_source"].isin(val_sources)].values
+            test_idx = combined.index[combined["_source"].isin(test_sources)].values
             resolved_strategy = "chronological_day_stress"
         else:
             raise ValueError(f"Unsupported CICIDS offline split strategy: {split_strategy}")
-        train_records, val_records, test_records = _apply_row_limits(
-            list(train_records),
-            list(val_records),
-            list(test_records),
-            row_limits,
-            seed,
-        )
+
+        train_df = combined.iloc[train_idx]
+        val_df = combined.iloc[val_idx]
+        test_df = combined.iloc[test_idx]
+
+        def _stratified_sample_df(df: pd.DataFrame, limit: int, seed: int) -> pd.DataFrame:
+            if limit <= 0 or len(df) <= limit:
+                return df
+            labels = df["Label"].values
+            counts = pd.Series(labels).value_counts()
+            if counts.min() < 2:
+                return df.head(limit)
+            sampled, _ = train_test_split(df, train_size=limit, random_state=seed, stratify=labels)
+            return sampled
+
+        train_df = _stratified_sample_df(train_df, row_limits.train, seed)
+        val_df = _stratified_sample_df(val_df, row_limits.val, seed + 1)
+        test_df = _stratified_sample_df(test_df, row_limits.test, seed + 2)
+
+        train_records = _dataframe_to_records(train_df)
+        val_records = _dataframe_to_records(val_df)
+        test_records = _dataframe_to_records(test_df)
+
         return OfflineSplit(
             dataset="cicids2017",
             benign_label=CICIDS_BENIGN_LABEL,
@@ -381,8 +472,8 @@ def build_offline_split(
         )
 
     if normalized == "unsw_nb15":
-        records = _dedupe_records(list(_iter_unsw_records(data_dir)))
-        official_train = [record for record in records if record.source == "UNSW_NB15_training-set.csv"]
+        records = list(_iter_unsw_records(data_dir))
+        official_train = _dedupe_records([record for record in records if record.source == "UNSW_NB15_training-set.csv"])
         official_test = [record for record in records if record.source == "UNSW_NB15_testing-set.csv"]
         if split_strategy not in {"dataset_default", "official", "official_train_test_plus_val"}:
             raise ValueError(f"Unsupported UNSW offline split strategy: {split_strategy}")
@@ -403,7 +494,7 @@ def build_offline_split(
             benign_label=UNSW_BENIGN_LABEL,
             class_labels=UNSW_CLASSES,
             forced_categorical=UNSW_FORCED_CATEGORICAL,
-            numeric_transform="zscore",
+            numeric_transform="minmax",
             train_records=train_records,
             val_records=val_records,
             test_records=test_records,
@@ -507,7 +598,7 @@ def build_unsw_stream(
         benign_label=UNSW_BENIGN_LABEL,
         class_labels=UNSW_CLASSES,
         forced_categorical=UNSW_FORCED_CATEGORICAL,
-        numeric_transform="zscore",
+        numeric_transform="minmax",
         warmup_records=warmup_records,
         window_factory=factory,
     )

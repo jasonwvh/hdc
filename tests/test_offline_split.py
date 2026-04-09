@@ -98,6 +98,7 @@ def test_unsw_offline_split_respects_official_test_boundary(tmp_path: Path) -> N
     assert all(record.source == "UNSW_NB15_training-set.csv" for record in split.train_records)
     assert all(record.source == "UNSW_NB15_training-set.csv" for record in split.val_records)
     assert all(record.source == "UNSW_NB15_testing-set.csv" for record in split.test_records)
+    assert split.numeric_transform == "minmax"
 
 
 def test_cicids_chronological_day_stress_split_uses_expected_files(tmp_path: Path) -> None:

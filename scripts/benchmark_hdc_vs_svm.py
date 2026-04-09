@@ -16,10 +16,95 @@ def _load_csv(path: Path) -> list[dict[str, str]]:
         return list(csv.DictReader(handle))
 
 
+def _load_json(path: Path) -> dict:
+    if not path.exists():
+        return {}
+    with path.open("r", encoding="utf-8") as handle:
+        return json.load(handle)
+
+
+def _safe_ratio(numerator: float, denominator: float) -> float:
+    if denominator == 0.0:
+        return 0.0
+    return numerator / denominator
+
+
+def _reconstruct_binary_counts(metric_row: dict[str, str]) -> tuple[float, float, float, float]:
+    row_count = float(metric_row["row_count"])
+    accuracy = float(metric_row["binary_accuracy"])
+    recall = float(metric_row["binary_recall"])
+    benign_fp_rate = float(metric_row["benign_fp_rate"])
+    denominator = recall + benign_fp_rate - 1.0
+
+    if abs(denominator) > 1e-9:
+        positive_rate = (accuracy - (1.0 - benign_fp_rate)) / denominator
+    else:
+        precision = float(metric_row["binary_precision"])
+        fallback = recall * (1.0 - precision) + precision * benign_fp_rate
+        positive_rate = _safe_ratio(precision * benign_fp_rate, fallback) if abs(fallback) > 1e-9 else 0.0
+
+    positive_rate = min(max(positive_rate, 0.0), 1.0)
+    positive_count = positive_rate * row_count
+    negative_count = row_count - positive_count
+    tp = recall * positive_count
+    fn = positive_count - tp
+    fp = benign_fp_rate * negative_count
+    tn = negative_count - fp
+    return tp, fp, fn, tn
+
+
+def _continual_binary_fallback_scope(
+    metrics_rows: list[dict[str, str]],
+    latency_rows: list[dict[str, str]],
+    training_row: dict[str, str],
+) -> dict:
+    tp = fp = fn = tn = 0.0
+    attack_recall_sum = 0.0
+    attack_recall_n = 0
+    total_rows = 0.0
+    total_inference_ms = 0.0
+    total_per_1k_ms = 0.0
+
+    for row in metrics_rows:
+        row_tp, row_fp, row_fn, row_tn = _reconstruct_binary_counts(row)
+        tp += row_tp
+        fp += row_fp
+        fn += row_fn
+        tn += row_tn
+        attack_recall_sum += float(row["attack_recall_macro"])
+        attack_recall_n += 1
+        total_rows += float(row["row_count"])
+
+    for row in latency_rows:
+        row_count = float(row["row_count"])
+        total_inference_ms += float(row["inference_per_1k_rows_ms"]) * row_count / 1000.0
+        total_per_1k_ms += float(row["per_1k_rows_ms"]) * row_count / 1000.0
+
+    accuracy = _safe_ratio(tp + tn, tp + tn + fp + fn)
+    precision = _safe_ratio(tp, tp + fp)
+    recall = _safe_ratio(tp, tp + fn)
+    binary_f1 = _safe_ratio(2.0 * precision * recall, precision + recall)
+    return {
+        "benchmark_mode": "continual",
+        "task_mode": "binary",
+        "dataset": metrics_rows[0]["dataset"] if metrics_rows else "unknown",
+        "accuracy": accuracy,
+        "binary_f1": binary_f1,
+        "macro_f1": binary_f1,
+        "weighted_f1": binary_f1,
+        "attack_recall_macro": attack_recall_sum / max(attack_recall_n, 1),
+        "latency_mode": "inference_only_stream_aggregate_fallback",
+        "inference_per_1k_rows_ms": _safe_ratio(total_inference_ms * 1000.0, total_rows),
+        "training_total_ms": float(training_row["training_total_ms"]),
+        "training_per_1k_rows_ms": float(training_row["training_per_1k_warmup_rows_ms"]),
+    }
+
+
 def load_scope(run_dir: Path, benchmark_mode: str, task_mode: str, split_name: str) -> dict:
     metrics_rows = _load_csv(run_dir / "metrics.csv")
     latency_rows = _load_csv(run_dir / "latency.csv")
     training_rows = _load_csv(run_dir / "training.csv")
+    summary = _load_json(run_dir / "summary.json")
 
     if benchmark_mode == "offline":
         metric_row = next(
@@ -52,6 +137,40 @@ def load_scope(run_dir: Path, benchmark_mode: str, task_mode: str, split_name: s
 
     def mean(rows: list[dict[str, str]], key: str) -> float:
         return sum(float(row[key]) for row in rows) / max(len(rows), 1)
+
+    if summary.get("headline_metric_basis") == "aggregate_stream":
+        if task_mode == "binary":
+            return {
+                "benchmark_mode": "continual",
+                "task_mode": task_mode,
+                "dataset": summary.get("dataset", "unknown"),
+                "accuracy": float(summary["headline_binary_accuracy"]),
+                "binary_f1": float(summary["headline_binary_f1"]),
+                "macro_f1": float(summary["headline_binary_f1"]),
+                "weighted_f1": float(summary["headline_binary_f1"]),
+                "attack_recall_macro": float(summary["headline_attack_recall_macro"]),
+                "latency_mode": "inference_only_stream_aggregate",
+                "inference_per_1k_rows_ms": float(summary.get("headline_inference_per_1k_rows_ms", summary.get("mean_inference_per_1k_rows_ms", 0.0))),
+                "training_total_ms": float(summary["training_total_ms"]),
+                "training_per_1k_rows_ms": float(summary["training_per_1k_warmup_rows_ms"]),
+            }
+        return {
+            "benchmark_mode": "continual",
+            "task_mode": task_mode,
+            "dataset": summary.get("dataset", "unknown"),
+            "accuracy": float(summary["headline_multiclass_accuracy"]),
+            "binary_f1": float(summary["headline_binary_f1"]),
+            "macro_f1": float(summary["headline_multiclass_macro_f1"]),
+            "weighted_f1": float(summary["headline_multiclass_weighted_f1"]),
+            "attack_recall_macro": float(summary["headline_attack_recall_macro"]),
+            "latency_mode": "inference_only_stream_aggregate",
+            "inference_per_1k_rows_ms": float(summary.get("headline_inference_per_1k_rows_ms", summary.get("mean_inference_per_1k_rows_ms", 0.0))),
+            "training_total_ms": float(summary["training_total_ms"]),
+            "training_per_1k_rows_ms": float(summary["training_per_1k_warmup_rows_ms"]),
+        }
+
+    if task_mode == "binary":
+        return _continual_binary_fallback_scope(filtered_metrics, filtered_latency, training_row)
 
     accuracy_key = "binary_accuracy" if task_mode == "binary" else "multiclass_accuracy"
     if filtered_metrics and accuracy_key not in filtered_metrics[0]:

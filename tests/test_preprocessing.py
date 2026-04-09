@@ -40,3 +40,45 @@ def test_dense_feature_selector_reduces_dense_dimension_train_only() -> None:
     assert filtered_train.dense.shape[1] == 2
     assert filtered_test.dense.shape[1] == 2
     assert np.array_equal(filtered_train.class_indices, train_batch.class_indices)
+
+
+def test_unsw_minmax_and_selector_preserve_categorical_dimensions() -> None:
+    records = [
+        RawRecord(
+            features={"dur": "0.0", "proto": "tcp", "service": "http", "state": "FIN"},
+            internal_label="Normal",
+            binary_label=0,
+            source="unit",
+            stage_name="unit",
+        ),
+        RawRecord(
+            features={"dur": "10.0", "proto": "udp", "service": "dns", "state": "CON"},
+            internal_label="Generic",
+            binary_label=1,
+            source="unit",
+            stage_name="unit",
+        ),
+    ]
+    preprocessor = TabularPreprocessor(
+        class_labels=["Normal", "Generic"],
+        benign_label="Normal",
+        forced_categorical={"proto", "service", "state"},
+        numeric_transform="minmax",
+    )
+    preprocessor.fit(records)
+    batch = preprocessor.transform_records(records, dataset="unsw_nb15", window_id=0, stage_name="train")
+
+    assert float(batch.numeric.min()) >= 0.0
+    assert float(batch.numeric.max()) <= 1.0
+
+    selector = DenseFeatureSelector(
+        mode="variance_mi",
+        variance_threshold=1e-6,
+        top_k=1,
+        candidate_indices=preprocessor.numeric_dense_indices(),
+        preserve_indices=preprocessor.categorical_dense_indices(),
+    )
+    selector.fit(batch.dense, batch.class_indices)
+    filtered = selector.transform_batch(batch)
+
+    assert filtered.dense.shape[1] == 1 + preprocessor.categorical_dense_indices().shape[0]

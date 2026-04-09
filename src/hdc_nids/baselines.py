@@ -10,7 +10,7 @@ import numpy as np
 from sklearn.linear_model import SGDClassifier
 from sklearn.metrics import f1_score
 from sklearn.neural_network import MLPClassifier
-from sklearn.svm import SVC
+from sklearn.svm import LinearSVC, SVC
 
 try:
     import torch
@@ -594,6 +594,7 @@ class OfflineSVMRBFModel(BaseModel):
             class_weight="balanced",
             probability=False,
             decision_function_shape="ovr",
+            cache_size=1024,
             random_state=seed,
         )
 
@@ -602,16 +603,18 @@ class OfflineSVMRBFModel(BaseModel):
 
     def predict(self, batch: PreparedBatch) -> PredictionOutput:
         score_start = monotonic_ms()
-        predicted_class_indices = self.estimator.predict(batch.dense).astype(np.int32)
         decision = self.estimator.decision_function(batch.dense)
         score_ms = monotonic_ms() - score_start
-        if decision.ndim == 1:
-            decision = np.column_stack([-decision, decision])
-        probabilities = decision.astype(np.float32)
+        estimator_classes = np.asarray(self.estimator.classes_, dtype=np.int32)
+        probabilities, predicted_class_indices = _offline_svm_scores_and_predictions(
+            decision=decision,
+            estimator_classes=estimator_classes,
+            class_count=len(self.class_labels),
+        )
         predicted_labels = np.asarray([self.class_labels[idx] for idx in predicted_class_indices], dtype=object)
         benign_scores = probabilities[:, self.benign_index]
         attack_scores = probabilities[:, self.attack_indices].max(axis=1)
-        predicted_binary = (attack_scores > benign_scores).astype(np.int8)
+        predicted_binary = (predicted_class_indices != self.benign_index).astype(np.int8)
         binary_margin = np.abs(benign_scores - attack_scores).astype(np.float32)
         return PredictionOutput(
             predicted_class_indices=predicted_class_indices,
@@ -637,6 +640,97 @@ class OfflineSVMRBFModel(BaseModel):
         return int(self.estimator.support_vectors_.nbytes)
 
 
+class OfflineSVMLinearModel(BaseModel):
+    """Conventional offline SVM baseline with linear kernel."""
+
+    def __init__(
+        self,
+        *,
+        preprocessor: TabularPreprocessor,
+        c_value: float,
+        max_iter: int,
+        seed: int,
+    ) -> None:
+        self.preprocessor = preprocessor
+        self.class_labels = preprocessor.class_labels
+        self.benign_index = preprocessor.class_to_index[preprocessor.benign_label]
+        self.attack_indices = [idx for idx in range(len(self.class_labels)) if idx != self.benign_index]
+        self.estimator = LinearSVC(
+            C=c_value,
+            class_weight="balanced",
+            dual="auto",
+            multi_class="ovr",
+            max_iter=max_iter,
+            random_state=seed,
+        )
+
+    def fit_initial(self, batch: PreparedBatch) -> None:
+        self.estimator.fit(batch.dense, batch.class_indices)
+
+    def predict(self, batch: PreparedBatch) -> PredictionOutput:
+        score_start = monotonic_ms()
+        decision = self.estimator.decision_function(batch.dense)
+        score_ms = monotonic_ms() - score_start
+        estimator_classes = np.asarray(self.estimator.classes_, dtype=np.int32)
+        probabilities, predicted_class_indices = _offline_svm_scores_and_predictions(
+            decision=decision,
+            estimator_classes=estimator_classes,
+            class_count=len(self.class_labels),
+        )
+        predicted_labels = np.asarray([self.class_labels[idx] for idx in predicted_class_indices], dtype=object)
+        benign_scores = probabilities[:, self.benign_index]
+        attack_scores = probabilities[:, self.attack_indices].max(axis=1)
+        predicted_binary = (predicted_class_indices != self.benign_index).astype(np.int8)
+        binary_margin = np.abs(benign_scores - attack_scores).astype(np.float32)
+        return PredictionOutput(
+            predicted_class_indices=predicted_class_indices,
+            predicted_labels=predicted_labels,
+            predicted_binary=predicted_binary,
+            class_scores=probabilities,
+            attack_scores=attack_scores.astype(np.float32),
+            benign_scores=benign_scores.astype(np.float32),
+            binary_margin=binary_margin,
+            query_hv=batch.dense.astype(np.float32),
+            encode_ms=0.0,
+            score_ms=score_ms,
+        )
+
+    def checkpoint(self, path: str | Path) -> None:
+        np.savez_compressed(
+            path,
+            coef_=self.estimator.coef_,
+            intercept_=self.estimator.intercept_,
+            classes_=self.estimator.classes_,
+        )
+
+    def model_size_bytes(self) -> int:
+        return int(self.estimator.coef_.nbytes + self.estimator.intercept_.nbytes)
+
+
+def _offline_svm_scores_and_predictions(
+    *,
+    decision: np.ndarray,
+    estimator_classes: np.ndarray,
+    class_count: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    if decision.ndim == 1:
+        signed_margin = decision.astype(np.float32, copy=False)
+        full_scores = np.full((signed_margin.shape[0], class_count), -1e6, dtype=np.float32)
+        negative_class = int(estimator_classes[0])
+        positive_class = int(estimator_classes[1])
+        full_scores[:, negative_class] = -signed_margin
+        full_scores[:, positive_class] = signed_margin
+        predicted_class_indices = np.where(signed_margin >= 0.0, positive_class, negative_class).astype(np.int32)
+        return full_scores, predicted_class_indices
+
+    dense_scores = decision.astype(np.float32, copy=False)
+    full_scores = np.full((dense_scores.shape[0], class_count), -1e6, dtype=np.float32)
+    full_scores[:, estimator_classes] = dense_scores
+    predicted_offsets = dense_scores.argmax(axis=1)
+    predicted_class_indices = estimator_classes[predicted_offsets].astype(np.int32)
+    return full_scores, predicted_class_indices
+
+
 class _OfflineTorchLSTM(nn.Module):
     def __init__(self, input_size: int, hidden_dim: int, class_count: int, dropout: float) -> None:
         super().__init__()
@@ -655,18 +749,20 @@ class _OfflineTorchLSTM(nn.Module):
 
 
 class OfflineLSTMModel(BaseModel):
-    """Offline PyTorch LSTM baseline for tabular IDS classification."""
+    """Offline PyTorch LSTM baseline using split-local sliding windows."""
 
     def __init__(
         self,
         *,
         preprocessor: TabularPreprocessor,
+        input_dim: int,
         hidden_dim: int,
         learning_rate: float,
         batch_size: int,
         dropout: float,
         max_epochs: int,
         patience: int,
+        sequence_length: int,
         segment_count: int,
         seed: int,
     ) -> None:
@@ -682,28 +778,35 @@ class OfflineLSTMModel(BaseModel):
         self.dropout = dropout
         self.max_epochs = max_epochs
         self.patience = patience
+        self.sequence_length = max(1, sequence_length)
         self.segment_count = max(1, segment_count)
         self.seed = seed
         self.device = torch.device("cpu")
+        self.input_dim = input_dim
 
-        self.segment_width = int(np.ceil(preprocessor.dense_dim / self.segment_count))
-        self.padded_dim = self.segment_width * self.segment_count
         torch.manual_seed(seed)
         self.model = _OfflineTorchLSTM(
-            input_size=self.segment_width,
+            input_size=input_dim,
             hidden_dim=hidden_dim,
             class_count=len(self.class_labels),
             dropout=dropout,
         ).to(self.device)
 
-    def _reshape_sequences(self, dense: np.ndarray) -> np.ndarray:
-        if dense.shape[1] < self.padded_dim:
-            pad_width = self.padded_dim - dense.shape[1]
-            dense = np.pad(dense, ((0, 0), (0, pad_width)), mode="constant")
-        return dense.reshape(dense.shape[0], self.segment_count, self.segment_width).astype(np.float32)
+    def _make_sequences(self, dense: np.ndarray) -> np.ndarray:
+        dense = dense.astype(np.float32, copy=False)
+        if dense.shape[0] == 0:
+            return np.zeros((0, self.sequence_length, dense.shape[1]), dtype=np.float32)
+        prefix = np.zeros((self.sequence_length - 1, dense.shape[1]), dtype=np.float32)
+        extended = np.vstack([prefix, dense]).astype(np.float32, copy=False)
+        sequences = np.zeros((dense.shape[0], self.sequence_length, dense.shape[1]), dtype=np.float32)
+        for row_idx in range(dense.shape[0]):
+            start = row_idx
+            stop = start + self.sequence_length
+            sequences[row_idx] = extended[start:stop]
+        return sequences
 
     def _predict_probabilities(self, dense: np.ndarray) -> np.ndarray:
-        sequences = self._reshape_sequences(dense)
+        sequences = self._make_sequences(dense)
         tensor = torch.tensor(sequences, dtype=torch.float32, device=self.device)
         self.model.eval()
         with torch.no_grad():
@@ -715,7 +818,7 @@ class OfflineLSTMModel(BaseModel):
         self.fit_with_validation(batch, batch)
 
     def fit_with_validation(self, train_batch: PreparedBatch, val_batch: PreparedBatch) -> float:
-        train_sequences = self._reshape_sequences(train_batch.dense.astype(np.float32))
+        train_sequences = self._make_sequences(train_batch.dense.astype(np.float32))
         train_labels = train_batch.class_indices.astype(np.int64)
         val_dense = val_batch.dense.astype(np.float32)
         class_counts = np.bincount(train_labels, minlength=len(self.class_labels)).astype(np.float32)

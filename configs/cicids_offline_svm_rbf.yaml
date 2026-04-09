@@ -2,7 +2,7 @@ dataset: cicids2017
 model_type: offline_svm_rbf
 benchmark_mode: offline
 task_mode: both
-experiment_name: cicids_offline_svm_rbf
+experiment_name: cicids_offline_svm_rbf_fixed
 data_dir: /Users/jasonwvh/Documents/projects/hdc/data
 output_dir: /Users/jasonwvh/Documents/projects/hdc/outputs/offline
 split_strategy: dataset_default

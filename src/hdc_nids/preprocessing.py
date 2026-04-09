@@ -37,6 +37,8 @@ class DenseFeatureSelector:
     mode: str = "none"
     variance_threshold: float = 0.0
     top_k: int = 0
+    candidate_indices: np.ndarray | None = None
+    preserve_indices: np.ndarray | None = None
     selected_indices: np.ndarray | None = None
 
     def fit(self, dense: np.ndarray, labels: np.ndarray) -> None:
@@ -45,14 +47,29 @@ class DenseFeatureSelector:
             self.selected_indices = np.arange(feature_count, dtype=np.int32)
             return
 
+        preserve = (
+            np.unique(self.preserve_indices.astype(np.int32))
+            if self.preserve_indices is not None and self.preserve_indices.size > 0
+            else np.zeros((0,), dtype=np.int32)
+        )
+        if self.candidate_indices is not None and self.candidate_indices.size > 0:
+            candidate_indices = np.unique(self.candidate_indices.astype(np.int32))
+        else:
+            candidate_indices = np.arange(feature_count, dtype=np.int32)
+        if preserve.size:
+            candidate_indices = np.setdiff1d(candidate_indices, preserve, assume_unique=False)
+        if candidate_indices.size == 0:
+            self.selected_indices = np.sort(preserve.astype(np.int32))
+            return
+
         candidate_mask = np.ones((feature_count,), dtype=bool)
         if "variance" in self.mode:
-            variances = np.var(dense, axis=0)
-            candidate_mask &= variances > float(self.variance_threshold)
-
-        candidate_indices = np.flatnonzero(candidate_mask).astype(np.int32)
+            variances = np.var(dense[:, candidate_indices], axis=0)
+            candidate_mask = variances > float(self.variance_threshold)
+            candidate_indices = candidate_indices[candidate_mask]
         if candidate_indices.size == 0:
-            candidate_indices = np.arange(feature_count, dtype=np.int32)
+            self.selected_indices = np.sort(preserve.astype(np.int32))
+            return
 
         if "mi" in self.mode and self.top_k > 0 and candidate_indices.size > self.top_k:
             scores = mutual_info_classif(
@@ -64,7 +81,7 @@ class DenseFeatureSelector:
             order = np.argsort(scores)[::-1]
             candidate_indices = candidate_indices[order[: self.top_k]]
 
-        self.selected_indices = np.sort(candidate_indices.astype(np.int32))
+        self.selected_indices = np.sort(np.concatenate([candidate_indices.astype(np.int32), preserve]))
 
     def transform(self, dense: np.ndarray) -> np.ndarray:
         if self.selected_indices is None:
@@ -152,6 +169,8 @@ class TabularPreprocessor:
         self.categorical_features: list[str] = []
         self.numeric_means: np.ndarray | None = None
         self.numeric_stds: np.ndarray | None = None
+        self.numeric_mins: np.ndarray | None = None
+        self.numeric_maxs: np.ndarray | None = None
         self.category_vocab: dict[str, dict[str, int]] = {}
         self.dense_dim: int = 0
         self._dense_offsets: dict[str, tuple[int, int]] = {}
@@ -202,11 +221,20 @@ class TabularPreprocessor:
             stds = np.nanstd(numeric_matrix, axis=0)
             stds = np.where(stds < 1e-6, 1.0, stds)
             means = np.where(np.isnan(means), 0.0, means)
+            mins = np.nanmin(numeric_matrix, axis=0)
+            maxs = np.nanmax(numeric_matrix, axis=0)
+            mins = np.where(np.isnan(mins), 0.0, mins)
+            maxs = np.where(np.isnan(maxs), 1.0, maxs)
+            maxs = np.where((maxs - mins) < 1e-6, mins + 1.0, maxs)
             self.numeric_means = means.astype(np.float32)
             self.numeric_stds = stds.astype(np.float32)
+            self.numeric_mins = mins.astype(np.float32)
+            self.numeric_maxs = maxs.astype(np.float32)
         else:
             self.numeric_means = np.zeros((0,), dtype=np.float32)
             self.numeric_stds = np.zeros((0,), dtype=np.float32)
+            self.numeric_mins = np.zeros((0,), dtype=np.float32)
+            self.numeric_maxs = np.zeros((0,), dtype=np.float32)
 
         dense_offset = 0
         self._dense_offsets = {}
@@ -226,9 +254,25 @@ class TabularPreprocessor:
         self.dense_dim = dense_offset
 
     def _normalize_numeric(self, values: np.ndarray) -> np.ndarray:
+        if self.numeric_transform == "minmax":
+            scaled = (values - self.numeric_mins) / np.clip(self.numeric_maxs - self.numeric_mins, 1e-6, None)
+            scaled = np.nan_to_num(scaled, nan=0.0, posinf=1.0, neginf=0.0)
+            return np.clip(scaled, 0.0, 1.0).astype(np.float32)
         standardized = (values - self.numeric_means) / self.numeric_stds
         standardized = np.nan_to_num(standardized, nan=0.0, posinf=0.0, neginf=0.0)
         return np.clip(standardized, -self.z_clip, self.z_clip).astype(np.float32)
+
+    def numeric_dense_indices(self) -> np.ndarray:
+        return np.arange(len(self.numeric_features), dtype=np.int32)
+
+    def categorical_dense_indices(self) -> np.ndarray:
+        indices: list[np.ndarray] = []
+        for feature in self.categorical_features:
+            start, end = self._dense_offsets[feature]
+            indices.append(np.arange(start, end, dtype=np.int32))
+        if not indices:
+            return np.zeros((0,), dtype=np.int32)
+        return np.concatenate(indices).astype(np.int32)
 
     def transform_records(
         self,

@@ -13,6 +13,7 @@ import numpy as np
 from .baselines import (
     EWCMLPModel,
     OfflineLSTMModel,
+    OfflineSVMLinearModel,
     OfflineSVMRBFModel,
     OnlineLSTMModel,
     OnlineSVMModel,
@@ -20,9 +21,10 @@ from .baselines import (
     StaticSVMModel,
 )
 from .config import ExperimentConfig, load_config
+from .constants import CICIDS_FILE_ORDER
 from .data import DatasetStream, OfflineSplit, RawRecord, build_offline_split, build_stream
 from .encoding import TabularHDCEncoder
-from .metrics import compute_offline_metrics, compute_window_metrics, detect_drift
+from .metrics import compute_continual_headline_metrics, compute_offline_metrics, compute_window_metrics, detect_drift
 from .models import DualMemoryHDCModel, OnlineHDModel, PaperOnlineHDModel, StaticHDCModel
 from .plots import plot_binary_f1, plot_drift_recovery, plot_forgetting, plot_latency
 from .preprocessing import DenseFeatureSelector, PreparedBatch, TabularPreprocessor
@@ -75,6 +77,26 @@ def _collapse_records(records: list[RawRecord], task_name: str, benign_label: st
     return collapsed
 
 
+def _record_sequence_key(dataset: str, record: RawRecord) -> tuple[int, int, str]:
+    source_order = 0
+    if dataset == "cicids2017":
+        cicids_order = {name: idx for idx, name in enumerate(CICIDS_FILE_ORDER)}
+        source_order = cicids_order.get(record.source, len(cicids_order))
+    elif dataset == "unsw_nb15":
+        unsw_order = {
+            "UNSW_NB15_training-set.csv": 0,
+            "UNSW_NB15_testing-set.csv": 1,
+        }
+        source_order = unsw_order.get(record.source, len(unsw_order))
+    row_order = 0
+    if record.record_id and ":" in record.record_id:
+        try:
+            row_order = int(record.record_id.rsplit(":", 1)[1])
+        except ValueError:
+            row_order = 0
+    return source_order, row_order, record.record_id
+
+
 def _build_preprocessor(
     *,
     class_labels: list[str],
@@ -101,6 +123,65 @@ def _build_feature_selector(config: ExperimentConfig, train_batch: PreparedBatch
     )
     selector.fit(train_batch.dense, train_batch.class_indices)
     return selector
+
+
+def _build_feature_selector_for_preprocessor(
+    config: ExperimentConfig,
+    preprocessor: TabularPreprocessor,
+    train_batch: PreparedBatch,
+) -> DenseFeatureSelector:
+    candidate_indices = None
+    preserve_indices = None
+    if train_batch.dataset == "unsw_nb15":
+        candidate_indices = preprocessor.numeric_dense_indices()
+        preserve_indices = preprocessor.categorical_dense_indices()
+    selector = DenseFeatureSelector(
+        mode=config.feature_selection.mode,
+        variance_threshold=config.feature_selection.variance_threshold,
+        top_k=config.feature_selection.top_k,
+        candidate_indices=candidate_indices,
+        preserve_indices=preserve_indices,
+    )
+    selector.fit(train_batch.dense, train_batch.class_indices)
+    return selector
+
+
+def _oversample_records_for_label(
+    records: list[RawRecord],
+    *,
+    label: str,
+    target_fraction: float,
+    seed: int,
+) -> list[RawRecord]:
+    if not records:
+        return []
+    label_records = [record for record in records if record.internal_label == label]
+    if not label_records:
+        return list(records)
+    current = len(label_records)
+    total = len(records)
+    current_fraction = current / max(total, 1)
+    if current_fraction >= target_fraction:
+        return list(records)
+    required = int(np.ceil((target_fraction * total - current) / max(1.0 - target_fraction, 1e-6)))
+    if required <= 0:
+        return list(records)
+    rng = np.random.default_rng(seed)
+    sampled_indices = rng.integers(0, len(label_records), size=required)
+    augmented = list(records)
+    for dup_idx, source_idx in enumerate(sampled_indices.tolist()):
+        record = label_records[source_idx]
+        augmented.append(
+            RawRecord(
+                features=dict(record.features),
+                internal_label=record.internal_label,
+                binary_label=record.binary_label,
+                source=record.source,
+                stage_name=record.stage_name,
+                record_id=f"{record.record_id}#os{dup_idx}",
+            )
+        )
+    return augmented
 
 
 def _build_online_model(config: ExperimentConfig, preprocessor: TabularPreprocessor) -> Any:
@@ -242,6 +323,11 @@ def _run_continual_experiment(config: ExperimentConfig, run_dir: Path) -> dict[s
     metric_rows: list[dict[str, Any]] = []
     latency_rows: list[dict[str, Any]] = []
     drift_rows: list[dict[str, Any]] = []
+    true_binary_chunks: list[np.ndarray] = []
+    predicted_binary_chunks: list[np.ndarray] = []
+    attack_score_chunks: list[np.ndarray] = []
+    true_class_chunks: list[np.ndarray] = []
+    predicted_class_chunks: list[np.ndarray] = []
     best_attack_recall = {label: 0.0 for label in preprocessor.class_labels if label != preprocessor.benign_label}
     drift_cooloff = 0
 
@@ -251,6 +337,11 @@ def _run_continual_experiment(config: ExperimentConfig, run_dir: Path) -> dict[s
             continue
 
         prediction = model.predict(batch)
+        true_binary_chunks.append(batch.binary_labels.astype(np.int8, copy=True))
+        predicted_binary_chunks.append(prediction.predicted_binary.astype(np.int8, copy=True))
+        attack_score_chunks.append(prediction.attack_scores.astype(np.float32, copy=True))
+        true_class_chunks.append(batch.class_indices.astype(np.int32, copy=True))
+        predicted_class_chunks.append(prediction.predicted_class_indices.astype(np.int32, copy=True))
         bundle = compute_window_metrics(
             batch=batch,
             predicted_labels=prediction.predicted_labels,
@@ -345,16 +436,51 @@ def _run_continual_experiment(config: ExperimentConfig, run_dir: Path) -> dict[s
     if latency_rows:
         plot_latency(latency_rows, run_dir / "model_size_latency.png")
 
+    headline_metrics: dict[str, Any] = {}
+    if true_binary_chunks:
+        aggregate_bundle = compute_continual_headline_metrics(
+            true_class_indices=np.concatenate(true_class_chunks),
+            predicted_class_indices=np.concatenate(predicted_class_chunks),
+            true_binary=np.concatenate(true_binary_chunks),
+            predicted_binary=np.concatenate(predicted_binary_chunks),
+            attack_scores=np.concatenate(attack_score_chunks),
+            class_count=len(preprocessor.class_labels),
+            benign_index=preprocessor.class_to_index[preprocessor.benign_label],
+        )
+        headline_metrics.update(aggregate_bundle.row)
+
+    attack_windows = [row for row in metric_rows if int(row.get("attack_row_count", 0)) > 0]
+    benign_only_windows = [row for row in metric_rows if int(row.get("attack_row_count", 0)) == 0]
+    total_rows = float(np.sum([row["row_count"] for row in metric_rows])) if metric_rows else 0.0
+    total_inference_ms = (
+        float(np.sum([row["inference_per_1k_rows_ms"] * row["row_count"] / 1000.0 for row in latency_rows]))
+        if latency_rows
+        else 0.0
+    )
+    total_stream_ms = (
+        float(np.sum([row["per_1k_rows_ms"] * row["row_count"] / 1000.0 for row in latency_rows]))
+        if latency_rows
+        else 0.0
+    )
+
     summary = {
         "benchmark_mode": "continual",
         "experiment_name": config.experiment_name,
         "dataset": config.dataset,
         "model_type": config.model_type,
         "windows": len(metric_rows),
+        "headline_inference_per_1k_rows_ms": (total_inference_ms * 1000.0 / total_rows) if total_rows else 0.0,
+        "headline_per_1k_rows_ms": (total_stream_ms * 1000.0 / total_rows) if total_rows else 0.0,
         "mean_binary_f1": float(np.mean([row["binary_f1"] for row in metric_rows])) if metric_rows else 0.0,
         "mean_multiclass_macro_f1": float(np.mean([row["multiclass_macro_f1"] for row in metric_rows])) if metric_rows else 0.0,
         "mean_attack_recall_macro": float(np.mean([row["attack_recall_macro"] for row in metric_rows])) if metric_rows else 0.0,
         "mean_avg_forgetting": float(np.mean([row["avg_forgetting"] for row in metric_rows])) if metric_rows else 0.0,
+        "attack_window_count": len(attack_windows),
+        "benign_only_window_count": len(benign_only_windows),
+        "attack_window_mean_binary_f1": float(np.mean([row["binary_f1"] for row in attack_windows])) if attack_windows else 0.0,
+        "attack_window_mean_binary_pr_auc": float(np.mean([row["binary_pr_auc"] for row in attack_windows])) if attack_windows else 0.0,
+        "benign_only_window_accuracy": float(np.mean([row["binary_accuracy"] for row in benign_only_windows])) if benign_only_windows else 0.0,
+        "benign_only_window_specificity": float(np.mean([1.0 - row["benign_fp_rate"] for row in benign_only_windows])) if benign_only_windows else 0.0,
         "mean_inference_per_1k_rows_ms": float(np.mean([row["inference_per_1k_rows_ms"] for row in latency_rows])) if latency_rows else 0.0,
         "mean_per_1k_rows_ms": float(np.mean([row["per_1k_rows_ms"] for row in latency_rows])) if latency_rows else 0.0,
         "warmup_rows": warmup_batch.size,
@@ -366,6 +492,7 @@ def _run_continual_experiment(config: ExperimentConfig, run_dir: Path) -> dict[s
         "training_per_1k_warmup_rows_ms": training_total_ms * 1000.0 / max(warmup_batch.size, 1),
         "drift_event_count": len([row for row in drift_rows if row.get("event_type") == "drift_trigger"]),
     }
+    summary.update(headline_metrics)
     json_dump(run_dir / "summary.json", summary)
     return summary
 
@@ -551,6 +678,46 @@ def _fit_offline_svm(
     return best_model, best_params
 
 
+def _fit_offline_svm_linear(
+    *,
+    config: ExperimentConfig,
+    preprocessor: TabularPreprocessor,
+    train_batch: PreparedBatch,
+    val_batch: PreparedBatch,
+    task_name: str,
+) -> tuple[Any, dict[str, Any]]:
+    best_model = None
+    best_score = -1.0
+    best_params: dict[str, Any] = {}
+    for c_value in config.svm.c_values:
+        model = OfflineSVMLinearModel(
+            preprocessor=preprocessor,
+            c_value=float(c_value),
+            max_iter=config.svm.max_iter,
+            seed=config.seed,
+        )
+        model.fit_initial(train_batch)
+        val_prediction = model.predict(val_batch)
+        metrics = compute_offline_metrics(
+            true_labels=val_batch.internal_labels,
+            predicted_labels=val_prediction.predicted_labels,
+            true_binary=val_batch.binary_labels,
+            predicted_binary=val_prediction.predicted_binary,
+            attack_scores=val_prediction.attack_scores,
+            class_labels=preprocessor.class_labels,
+            benign_label=preprocessor.benign_label,
+            dataset=val_batch.dataset,
+            split_name="val",
+            task_mode=task_name,
+        )
+        score = _offline_selection_score(metrics.row, task_name)
+        if score > best_score:
+            best_model = model
+            best_score = score
+            best_params = {"c": float(c_value), "validation_score": score}
+    return best_model, best_params
+
+
 def _fit_offline_lstm(
     *,
     config: ExperimentConfig,
@@ -560,12 +727,14 @@ def _fit_offline_lstm(
 ) -> tuple[Any, dict[str, Any]]:
     model = OfflineLSTMModel(
         preprocessor=preprocessor,
+        input_dim=int(train_batch.dense.shape[1]),
         hidden_dim=config.lstm.hidden_dim,
         learning_rate=config.lstm.learning_rate,
         batch_size=config.lstm.batch_size,
         dropout=config.lstm.dropout,
         max_epochs=config.lstm.max_epochs,
         patience=config.lstm.patience,
+        sequence_length=config.lstm.sequence_length,
         segment_count=config.lstm.segment_count,
         seed=config.seed,
     )
@@ -660,6 +829,17 @@ def _run_offline_experiment(config: ExperimentConfig, run_dir: Path) -> dict[str
         train_records = _collapse_records(split.train_records, task_name, split.benign_label)
         val_records = _collapse_records(split.val_records, task_name, split.benign_label)
         test_records = _collapse_records(split.test_records, task_name, split.benign_label)
+        if split.dataset == "unsw_nb15":
+            train_records = _oversample_records_for_label(
+                train_records,
+                label=split.benign_label,
+                target_fraction=0.495,
+                seed=config.seed,
+            )
+        if config.model_type == "offline_lstm":
+            train_records = sorted(train_records, key=lambda record: _record_sequence_key(split.dataset, record))
+            val_records = sorted(val_records, key=lambda record: _record_sequence_key(split.dataset, record))
+            test_records = sorted(test_records, key=lambda record: _record_sequence_key(split.dataset, record))
         task_labels = _task_labels(task_name, split.benign_label, split.class_labels)
 
         training_start = monotonic_ms()
@@ -679,8 +859,14 @@ def _run_offline_experiment(config: ExperimentConfig, run_dir: Path) -> dict[str
         test_batch = preprocessor.transform_records(test_records, dataset=split.dataset, window_id=2, stage_name="test")
         transform_ms = monotonic_ms() - transform_start
 
-        selector = _build_feature_selector(config, train_batch)
-        if config.model_type in {"offline_svm_rbf", "offline_lstm", "offline_hdc_one_pass", "offline_hdc_tuned"} and selector.selected_indices is not None:
+        selector = _build_feature_selector_for_preprocessor(config, preprocessor, train_batch)
+        if config.model_type in {
+            "offline_svm_rbf",
+            "offline_svm_linear",
+            "offline_lstm",
+            "offline_hdc_one_pass",
+            "offline_hdc_tuned",
+        } and selector.selected_indices is not None:
             train_batch = selector.transform_batch(train_batch)
             val_batch = selector.transform_batch(val_batch)
             test_batch = selector.transform_batch(test_batch)
@@ -706,6 +892,14 @@ def _run_offline_experiment(config: ExperimentConfig, run_dir: Path) -> dict[str
             )
         elif config.model_type == "offline_svm_rbf":
             model, fit_meta = _fit_offline_svm(
+                config=config,
+                preprocessor=preprocessor,
+                train_batch=train_batch,
+                val_batch=val_batch,
+                task_name=task_name,
+            )
+        elif config.model_type == "offline_svm_linear":
+            model, fit_meta = _fit_offline_svm_linear(
                 config=config,
                 preprocessor=preprocessor,
                 train_batch=train_batch,

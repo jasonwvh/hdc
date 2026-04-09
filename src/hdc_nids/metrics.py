@@ -32,6 +32,11 @@ class OfflineMetricBundle:
     confusion: np.ndarray
 
 
+@dataclass(slots=True)
+class ContinualHeadlineBundle:
+    row: dict[str, float | int | str]
+
+
 def compute_window_metrics(
     *,
     batch: PreparedBatch,
@@ -52,6 +57,8 @@ def compute_window_metrics(
 
     benign_mask = true_binary == 0
     benign_fp_rate = float(((predicted_binary == 1) & benign_mask).sum() / max(benign_mask.sum(), 1))
+    attack_row_count = int(np.sum(true_binary))
+    benign_row_count = int(batch.size - attack_row_count)
 
     per_class_recall: dict[str, float] = {}
     attack_recalls: list[float] = []
@@ -71,6 +78,9 @@ def compute_window_metrics(
             "dataset": batch.dataset,
             "stage_name": batch.stage_name,
             "row_count": batch.size,
+            "attack_row_count": attack_row_count,
+            "benign_row_count": benign_row_count,
+            "has_attack_window": int(attack_row_count > 0),
             "binary_accuracy": float(accuracy_score(true_binary, predicted_binary)),
             "multiclass_accuracy": float(accuracy_score(batch.internal_labels, predicted_labels)),
             "multiclass_macro_f1": float(
@@ -89,6 +99,54 @@ def compute_window_metrics(
         },
         per_class_recall=per_class_recall,
     )
+
+
+def compute_continual_headline_metrics(
+    *,
+    true_class_indices: np.ndarray,
+    predicted_class_indices: np.ndarray,
+    true_binary: np.ndarray,
+    predicted_binary: np.ndarray,
+    attack_scores: np.ndarray,
+    class_count: int,
+    benign_index: int,
+) -> ContinualHeadlineBundle:
+    row: dict[str, float | int | str] = {
+        "headline_binary_accuracy": float(accuracy_score(true_binary, predicted_binary)),
+        "headline_binary_precision": float(precision_score(true_binary, predicted_binary, zero_division=0)),
+        "headline_binary_recall": float(recall_score(true_binary, predicted_binary, zero_division=0)),
+        "headline_binary_f1": float(f1_score(true_binary, predicted_binary, zero_division=0)),
+        "headline_binary_auroc": 0.0,
+        "headline_binary_auprc": 0.0,
+        "headline_binary_specificity": 0.0,
+        "headline_multiclass_accuracy": float(accuracy_score(true_class_indices, predicted_class_indices)),
+        "headline_multiclass_macro_f1": float(
+            f1_score(true_class_indices, predicted_class_indices, average="macro", zero_division=0)
+        ),
+        "headline_multiclass_weighted_f1": float(
+            f1_score(true_class_indices, predicted_class_indices, average="weighted", zero_division=0)
+        ),
+        "headline_attack_recall_macro": 0.0,
+        "headline_metric_basis": "aggregate_stream",
+    }
+
+    if np.unique(true_binary).size > 1:
+        row["headline_binary_auroc"] = float(roc_auc_score(true_binary, attack_scores))
+        row["headline_binary_auprc"] = float(average_precision_score(true_binary, attack_scores))
+
+    benign_mask = true_binary == 0
+    if np.any(benign_mask):
+        row["headline_binary_specificity"] = float(np.mean(predicted_binary[benign_mask] == 0))
+
+    attack_recalls: list[float] = []
+    for class_index in range(class_count):
+        if class_index == benign_index:
+            continue
+        mask = true_class_indices == class_index
+        if np.any(mask):
+            attack_recalls.append(float(np.mean(predicted_class_indices[mask] == class_index)))
+    row["headline_attack_recall_macro"] = float(np.mean(attack_recalls)) if attack_recalls else 0.0
+    return ContinualHeadlineBundle(row=row)
 
 
 def detect_drift(

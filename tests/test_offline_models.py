@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import numpy as np
 
-from hdc_nids.baselines import OfflineLSTMModel, OfflineSVMRBFModel
+from hdc_nids.baselines import OfflineLSTMModel, OfflineSVMLinearModel, OfflineSVMRBFModel
 from hdc_nids.data import RawRecord
 from hdc_nids.preprocessing import TabularPreprocessor
 
@@ -40,14 +40,26 @@ def test_offline_svm_and_lstm_learn_separable_binary_data() -> None:
     svm_pred = svm.predict(test_batch)
     assert float(np.mean(svm_pred.predicted_labels == test_batch.internal_labels)) >= 1.0
 
+    linear_svm = OfflineSVMLinearModel(
+        preprocessor=preprocessor,
+        c_value=1.0,
+        max_iter=5000,
+        seed=7,
+    )
+    linear_svm.fit_initial(train_batch)
+    linear_pred = linear_svm.predict(test_batch)
+    assert float(np.mean(linear_pred.predicted_labels == test_batch.internal_labels)) >= 1.0
+
     lstm = OfflineLSTMModel(
         preprocessor=preprocessor,
+        input_dim=int(train_batch.dense.shape[1]),
         hidden_dim=8,
         learning_rate=0.01,
         batch_size=2,
         dropout=0.0,
         max_epochs=20,
         patience=3,
+        sequence_length=3,
         segment_count=2,
         seed=7,
     )

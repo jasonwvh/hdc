@@ -1,20 +1,14 @@
 dataset: cicids2017
-model_type: offline_hdc_one_pass
+model_type: offline_svm_linear
 benchmark_mode: offline
 task_mode: both
-experiment_name: cicids_offline_hdc_one_pass
+experiment_name: cicids_offline_svm_linear_fixed
 data_dir: /Users/jasonwvh/Documents/projects/hdc/data
 output_dir: /Users/jasonwvh/Documents/projects/hdc/outputs/offline
 split_strategy: dataset_default
 validation_fraction: 0.15
 latency_mode: inference_only
-hd_dim: 4096
-bins: 64
-base_lr: 0.035
-rare_class_boost: 2.5
-regen_rate: 0.05
 seed: 7
-prototype_clip: 4096
 row_limits:
   train: 12000
   val: 4000
@@ -23,11 +17,7 @@ feature_selection:
   mode: variance_mi
   variance_threshold: 1.0e-6
   top_k: 96
-hdc:
-  learning_rate: 0.035
-  bootstrap_fraction: 0.01
-  batch_size: 1024
-  iterative_epoch_candidates: [0]
-  regeneration_rounds: 0
-  scale_by_sqrt_features: true
-  row_normalize: false
+svm:
+  max_iter: 5000
+  c_values: [0.1, 1.0, 10.0]
+  gamma_values: ["scale"]

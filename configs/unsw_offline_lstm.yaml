@@ -2,7 +2,7 @@ dataset: unsw_nb15
 model_type: offline_lstm
 benchmark_mode: offline
 task_mode: both
-experiment_name: unsw_offline_lstm
+experiment_name: unsw_offline_lstm_litprep
 data_dir: /Users/jasonwvh/Documents/projects/hdc/data
 output_dir: /Users/jasonwvh/Documents/projects/hdc/outputs/offline
 split_strategy: dataset_default
@@ -19,6 +19,7 @@ feature_selection:
   top_k: 96
 lstm:
   hidden_dim: 64
+  sequence_length: 8
   learning_rate: 0.001
   batch_size: 256
   dropout: 0.2
